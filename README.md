@@ -22,10 +22,20 @@ sudo ln -sf "$(pwd)/mlpoc" /usr/local/bin/mlpoc
 mlpoc --help
 ```
 
+Switch まで一括で行うDemo：
 
 ```bash
+# quick survey remote models & releases
 mlpoc models
 mlpoc releases centerpoint
+mlpoc pull-switch centerpoint # you can pick model and automatically switch
+ll /opt/autoware/mlmodels/centerpoint
+```
+
+Pull だけ行い、あとで Switch する場合：
+
+```bash
+# pull & switch sample2
 mlpoc pull --model centerpoint --latest --target xx1 # or --pick
 mlpoc pull --model centerpoint --latest --target x2
 mlpoc switch centerpoint --latest --target xx1  # or --pick

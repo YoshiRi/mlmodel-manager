@@ -175,6 +175,13 @@ cmd_list_releases(){
 cmd_pull(){
   local model="" release_id="" release_name="" version_override="" target="" latest="0" output_json="0"
   local payload_subdir="" pick="0"
+
+  # ★ もし最初の引数が -- で始まっていなければ model として解釈
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    model="$1"
+    shift
+  fi
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --model) model="$2"; shift 2;;
@@ -183,7 +190,7 @@ cmd_pull(){
       --version) version_override="$2"; shift 2;;
       --target) target="$2"; shift 2;;
       --latest) latest="1"; shift;;
-      --pick) pick="1"; shift;;                # ★追加
+      --pick) pick="1"; shift;;
       --project-id) PROJECT_ID="$2"; shift 2;;
       --json) output_json="1"; shift;;
       --payload-subdir) payload_subdir="$2"; shift 2;;
@@ -193,6 +200,11 @@ cmd_pull(){
   [ -n "$model" ] || die "usage: mlpoc pull --model <name> [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
 
   ensure_dirs
+
+  # ★ もし release_id/release_name/version_override/target/latest が空で pick も未指定なら、自動で pick=1
+  if [ -z "$release_id$release_name$version_override$target" ] && [ "$latest" = "0" ] && [ "$pick" = "0" ]; then
+    pick=1
+  fi
 
   # ★ リリース選択：--pick が最優先（--target で絞り込み可能）
   local rid pid rname
