@@ -198,7 +198,7 @@ mlpoc current <model>
 * **原子的な切替**：一時リンク作成 → `rename` による置換で中断時も壊れリンクを見せない
 * **フラット展開**：payload ルート自動検出（最大数階層の空ディレクトリ剥離 → `<uuid>/<model>` 推測 → 重要ファイルを含む最浅ディレクトリ探索）
 * **権限最小化**：検証は非特権でも可能／実ファイル配置とリンク置換は `sudo` 実行
-* **ロギング**：`/var/lib/autoware-mlswitch/<model>.jsonl` に切替履歴を追記（ts/before/after）
+* **ロギング**：`logger -t mlpoc` 経由で syslog に切替履歴（model/ts/before/after）を JSON 形式で出力
 * **寛容な JSON パース**：`webauto` の返却差異に備え、複数のキー候補を許容する `jq` 式
 
 ---
