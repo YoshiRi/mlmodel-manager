@@ -6,8 +6,6 @@ PROJECT_ID="${WEBAUTO_PROJECT_ID:-prd_jt}"       # envで上書き可
 STORE_ROOT="${STORE_ROOT:-/opt/autoware/model-store}"
 LINK_ROOT="${LINK_ROOT:-/opt/autoware/mlmodels}"
 TARGET_DEFAULT="${TARGET_DEFAULT:-default}"       # 例: x2 等を都度指定可能
-LOG_DIR="$HOME/.local/share/autoware-mlswitch"
-mkdir -p "$LOG_DIR"
 
 # jqで拾うキー（webautoのJSONに合わせて必要なら微調整）
 JQ_PKG_LIST='.packages // .data // .results // .items // . | map({id: (.id // .package_id // .uuid), name: (.name // .package_name)})'
@@ -16,7 +14,7 @@ JQ_REL_LIST='.releases // .data // .results // .items // . | map({id: (.id // .r
 #=== 共通ユーティリティ =====================================================
 die(){ echo "Error: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null || die "command not found: $1"; }
-need webauto; need jq
+need webauto; need jq; need logger
 
 ensure_dirs(){ sudo mkdir -p "$STORE_ROOT" "$LINK_ROOT"; }
 
@@ -32,7 +30,9 @@ current_target(){ # $1: link
 }
 
 log_switch(){ # $1: model, $2: before, $3: after
-  echo "{\"ts\":$(date +%s),\"before\":\"$2\",\"after\":\"$3\"}" | sudo tee -a "$LOG_DIR/$1.jsonl" >/dev/null
+  local model="$1" before="$2" after="$3" ts
+  ts="$(date +%s)"
+  logger -t mlpoc "$(printf '{"model":"%s","ts":%s,"before":"%s","after":"%s"}' "$model" "$ts" "$before" "$after")"
 }
 
 #=== RELEASE選択の共通部品 ===============================================
@@ -475,6 +475,7 @@ Env:
   TARGET_DEFAULT       (default: default)
 
 Notes:
+  * 切替履歴は syslog（tag: mlpoc）に JSON 形式で記録されます。
   * /opt/autoware 配下の書換や参照切替には sudo が必要です。
   * list はローカルの実体を走査、switch は --target/--version からパスを自動解決します。
 EOF
