@@ -219,13 +219,11 @@ cmd_list_releases(){
 cmd_pull(){
   local model="" release_id="" release_name="" version_override="" target="" latest="0" output_json="0"
   local payload_subdir="" pick="0"
+  local limit="$DEFAULT_PAGE_LIMIT" max_pages="$DEFAULT_MAX_PAGES"
 
-  # ★ もし最初の引数が -- で始まっていなければ model として解釈
+  # 位置引数: <model> [<target>/<version>]
   if [[ $# -gt 0 && "$1" != --* ]]; then
-    model="$1"
-    shift
-
-    # ★ さらに次の引数が <target>/<version> 形式なら分解して設定
+    model="$1"; shift
     if [[ $# -gt 0 && "$1" =~ ^[^/]+/[^/]+$ ]]; then
       target="${1%%/*}"
       version_override="${1##*/}"
@@ -242,37 +240,38 @@ cmd_pull(){
       --target) target="$2"; shift 2;;
       --latest) latest="1"; shift;;
       --pick) pick="1"; shift;;
+      --limit) limit="$2"; shift 2;;
+      --max-pages) max_pages="$2"; shift 2;;
       --project-id) PROJECT_ID="$2"; shift 2;;
       --json) output_json="1"; shift;;
       --payload-subdir) payload_subdir="$2"; shift 2;;
       *) die "unknown arg: $1";;
     esac
   done
-  [ -n "$model" ] || die "usage: mlpoc pull --model <name> [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
+  [ -n "$model" ] || die "usage: mlpoc pull <model> [<target>/<version>] [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--limit N] [--max-pages M] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
 
   ensure_dirs
 
-  # ★ もし release_id/release_name/version_override/target/latest が空で pick も未指定なら、自動で pick=1
+  # セレクタ未指定なら自動で対話選択に
   if [ -z "$release_id$release_name$version_override$target" ] && [ "$latest" = "0" ] && [ "$pick" = "0" ]; then
     pick=1
   fi
 
-  # ★ リリース選択：--pick が最優先（--target で絞り込み可能）
+  # リリース解決
   local rid pid rname
   if [ "$pick" = "1" ]; then
-    IFS=$'\t' read -r rid pid rname < <(pick_release_interactive "$model" "$target")
+    IFS=$'\t' read -r rid pid rname < <(pick_release_interactive "$model" "$target" "$limit" "$max_pages")
   else
     IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
   fi
 
-  # ガード
   [ -n "$rid" ] || die "failed to resolve release_id (selector/pick)"
   [ -n "$pid" ] || die "failed to resolve package_id (selector/pick)"
   [ -n "$rname" ] || die "failed to resolve release name"
 
-
-  # name から target/version を抽出（スラッシュ無ければ target=default, version=name）
-  local parsed_target parsed_version; IFS=$'\t' read -r parsed_target parsed_version < <(parse_name_to_target_version "$rname")
+  # name → target/version
+  local parsed_target parsed_version
+  IFS=$'\t' read -r parsed_target parsed_version < <(parse_name_to_target_version "$rname")
 
   # pull
   local tmpdir; tmpdir="$(mktemp -d)"
@@ -283,40 +282,35 @@ cmd_pull(){
     --target-dir "$tmpdir" \
     --output json --quiet >/dev/null
 
-  # バージョン名の最終決定（--version で上書き可）
   local version="${version_override:-$parsed_version}"
   local target_final="${target:-$parsed_target}"
 
-  # 原子的配置のため staging を用意
+  # 原子的配置
   local dest="$STORE_ROOT/$model/$target_final/$version"
   local staging; staging="$(mktemp -d --tmpdir "$model.$target_final.$version.staging.XXXX")"
   sudo mkdir -p "$(dirname "$dest")"
   [ -z "$(ls -A "$tmpdir")" ] && die "pulled dir is empty: $tmpdir"
 
-  # ★フラット展開：payload ルートを決定
+  # フラット展開
   local payload_root
   if [ -n "$payload_subdir" ]; then
-    # 手動指定（tmpdir からの相対）
-    [ -d "$tmpdir/$payload_subdir" ] || die "--payload-subdir が不正: $payload_subdir"
+    [ -d "$tmpdir/$payload_subdir" ] || die "--payload-subdir invalid: $payload_subdir"
     payload_root="$tmpdir/$payload_subdir"
   else
     payload_root="$(detect_payload_root "$tmpdir" "$model")"
   fi
 
-  # 中身だけを staging へコピー（payload_root/. → staging/.）
   sudo cp -a "$payload_root"/. "$staging"/
   rm -rf "$tmpdir"
 
-  # 最低限検証
+  # 検証
   if ! sudo find "$staging" -type f -name '*.onnx' | grep -q .; then
     sudo rm -rf "$staging"; die "no .onnx found in staging"
   fi
 
-  # 既存と入替
   sudo rm -rf "$dest"
   sudo mv -T "$staging" "$dest"
 
-  # 出力は既存どおり
   if [ "$output_json" = "1" ]; then
     printf '{"model":"%s","target":"%s","version":"%s","path":"%s","release_id":"%s","package_id":"%s","name":"%s"}\n' \
       "$model" "$target_final" "$version" "$dest" "$rid" "$pid" "$rname"
@@ -490,7 +484,7 @@ case "${1:-}" in
   releases)    shift; cmd_list_releases "$@";;
   pull)        shift; cmd_pull "$@";;
   pull-switch) shift; cmd_pull_switch "$@";;
-  list)        shift; cmd_list_local "$@";;     # ★追加（ローカル一覧）
+  list)        shift; cmd_list_local "$@";;
   current)     shift; cmd_current "$@";;
   switch)      shift; cmd_switch "$@";;
   *)
@@ -505,11 +499,16 @@ Usage:
   mlpoc list <model>              # <target>/<version>/path の一覧
   mlpoc list <model> --json       # JSON で出力
 
-  # 取得のみ（配置するが参照は切り替えない）
-  sudo mlpoc pull --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json]
+  # 取得のみ（配置するが参照は切替えない）
+  # 位置引数でも指定可: mlpoc pull <model> [<target>/<version>]
+  sudo mlpoc pull <model> [<target>/<version>] \
+    [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] \
+    [--limit N] [--max-pages M] [--project-id <pid>] [--json] [--payload-subdir <relpath>]
 
   # 取得して参照も切替
-  sudo mlpoc pull-switch --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--no-switch]
+  sudo mlpoc pull-switch --model <name> \
+    [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] \
+    [--limit N] [--max-pages M] [--project-id <pid>] [--no-switch]
 
   # 現在の参照確認 / 既存実体へ手動切替
   mlpoc current <model>
@@ -522,23 +521,30 @@ Usage:
   sudo mlpoc switch <model> /opt/autoware/model-store/<model>/<target>/<version>
 
 Options:
-  --latest                   （switch/pull）候補のうち最新を選択（version は sort -V）
-  --pick                     （switch）対話選択モード。--target で候補を絞り込み可
+  --latest                   （pull/pull-switch/switch）候補のうち最新を選択
+  --pick                     （pull/pull-switch/switch）対話選択。--target で候補を絞り込み可
   --target <tgt>             例: xx1, x2
   --version <ver>            例: 2.3.1
-  --release-name <name>      例: "xx1/2.3.0"
+  --release-name <name>      例: "xx1/2.3.1"
   --release-id <rid>         直接ID
+  --limit N                  リリース探索の件数上限（既定: 30, 0=無制限）
+  --max-pages M              取得ページ上限（既定: 0=無制限）
   --project-id <pid>         既定=WEBAUTO_PROJECT_ID または prd_jt
   --json                     JSON出力（pull/list）
+  --payload-subdir <relpath> pull後の展開ルートを手動指定
 
 Env:
   WEBAUTO_PROJECT_ID   (default: prd_jt)
   STORE_ROOT           (default: /opt/autoware/model-store)
   LINK_ROOT            (default: /opt/autoware/mlmodels)
   TARGET_DEFAULT       (default: default)
+  DEFAULT_PAGE_LIMIT   (default: 30)
+  DEFAULT_MAX_PAGES    (default: 0)
+  PAGE_TOKEN_FLAG      (default: --page-token)
 
 Notes:
   * /opt/autoware 配下の書換や参照切替には sudo が必要です。
+  * pull の位置引数 <model> [<target>/<version>] は --model/--target/--version に読み替えます。
   * list はローカルの実体を走査、switch は --target/--version からパスを自動解決します。
 EOF
     ;;
