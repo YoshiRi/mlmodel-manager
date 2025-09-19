@@ -22,6 +22,26 @@
    * `/opt/autoware/mlmodels/<model>` → 対応する store パスへ **原子的にリンク置換**
    * 既存実体から **`--target/--version` 指定**または \*\*対話選択（`--pick`）\*\*で切替
 
+
+## Quick start
+
+もとの`/opt/autoware/mlmodels` に内容物がある場合消すがあります。必要に応じてバックアップしてください。
+
+```bash
+mlpoc models
+mlpoc releases centerpoint
+mlpoc pull --model centerpoint --latest --target xx1
+mlpoc pull --model centerpoint --latest --target x2
+mlpoc switch centerpoint --latest --target xx1  # or --pick
+mlpoc current centerpoint
+```
+
+完了すれば下記のような表示になるはずです。
+```bash
+❯ mlpoc current centerpoint
+/opt/autoware/model-store/centerpoint/xx1/2.3.1
+```
+
 ---
 
 ## ディレクトリ構成
