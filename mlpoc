@@ -202,8 +202,11 @@ cmd_pull(){
     IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
   fi
 
-  # release解決（package_idも同時に取得）
-  local rid pid rname; IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
+  # ガード
+  [ -n "$rid" ] || die "failed to resolve release_id (selector/pick)"
+  [ -n "$pid" ] || die "failed to resolve package_id (selector/pick)"
+  [ -n "$rname" ] || die "failed to resolve release name"
+
 
   # name から target/version を抽出（スラッシュ無ければ target=default, version=name）
   local parsed_target parsed_version; IFS=$'\t' read -r parsed_target parsed_version < <(parse_name_to_target_version "$rname")
