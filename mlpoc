@@ -180,6 +180,13 @@ cmd_pull(){
   if [[ $# -gt 0 && "$1" != --* ]]; then
     model="$1"
     shift
+
+    # ★ さらに次の引数が <target>/<version> 形式なら分解して設定
+    if [[ $# -gt 0 && "$1" =~ ^[^/]+/[^/]+$ ]]; then
+      target="${1%%/*}"
+      version_override="${1##*/}"
+      shift
+    fi
   fi
 
   while [[ $# -gt 0 ]]; do
