@@ -79,6 +79,47 @@ parse_name_to_target_version(){ # in: name ; out: echo "<target>\t<version>"
   fi
 }
 
+#=== リモート release を対話選択 ==========================================
+pick_release_interactive(){ # out: TSV "<release_id>\t<package_id>\t<name>"
+  local model="$1" target_filter="${2:-}"
+  local releases lines choice
+
+  releases="$(fetch_releases_json "$model")"
+  # target 指定があれば name の先頭 "target/" でフィルタ
+  if [ -n "$target_filter" ]; then
+    releases="$(echo "$releases" | jq --arg t "$target_filter" \
+    '[.[] | select((.name|type=="string") and (.name|startswith($t+"/")))]')"
+
+  fi
+
+  if [ "$(echo "$releases" | jq 'length')" -eq 0 ]; then
+    echo "no releases found for model=$model target=$target_filter" >&2
+    return 1
+  fi
+
+  # 表示: name + created_at（新しい順）
+  lines="$(echo "$releases" | jq -r '
+    sort_by(.created_at) | reverse
+    | .[] | [.name, (.created_at // ""), .id, .package_id] | @tsv')"
+
+
+  if command -v fzf >/dev/null; then
+    choice="$(printf "%s\n" "$lines" \
+      | fzf --with-nth=1,2 --prompt="select release > ")"
+  else
+    echo "Select release:"
+    nl -w2 -s'. ' <(printf "%s\n" "$lines" | cut -f1,2)
+    read -r -p "number: " n
+    choice="$(printf "%s\n" "$lines" | sed -n "${n}p")"
+  fi
+  [ -n "$choice" ] || return 1
+
+  # 返却: rid pid name
+  local name created_at rid pid
+  IFS=$'\t' read -r name created_at rid pid <<< "$choice"
+  printf "%s\t%s\t%s\n" "$rid" "$pid" "$name"
+}
+
 #=== payload ルート検出（フラット展開用） ===============================
 detect_payload_root(){ # $1: tmpdir, $2: model
   local base="$1" model="$2" d="$1"
@@ -133,7 +174,7 @@ cmd_list_releases(){
 #=== 3a) pull（切替なし） =================================================
 cmd_pull(){
   local model="" release_id="" release_name="" version_override="" target="" latest="0" output_json="0"
-  local payload_subdir=""
+  local payload_subdir="" pick="0"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --model) model="$2"; shift 2;;
@@ -142,15 +183,24 @@ cmd_pull(){
       --version) version_override="$2"; shift 2;;
       --target) target="$2"; shift 2;;
       --latest) latest="1"; shift;;
+      --pick) pick="1"; shift;;                # ★追加
       --project-id) PROJECT_ID="$2"; shift 2;;
       --json) output_json="1"; shift;;
-      --payload-subdir) payload_subdir="$2"; shift 2;;   # ★手動でサブディレクトリを指定したい場合
+      --payload-subdir) payload_subdir="$2"; shift 2;;
       *) die "unknown arg: $1";;
     esac
   done
-  [ -n "$model" ] || die "usage: mlpoc pull --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
+  [ -n "$model" ] || die "usage: mlpoc pull --model <name> [--pick | --latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
 
   ensure_dirs
+
+  # ★ リリース選択：--pick が最優先（--target で絞り込み可能）
+  local rid pid rname
+  if [ "$pick" = "1" ]; then
+    IFS=$'\t' read -r rid pid rname < <(pick_release_interactive "$model" "$target")
+  else
+    IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
+  fi
 
   # release解決（package_idも同時に取得）
   local rid pid rname; IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
