@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#=== 設定（必要に応じて変更可） ============================================
+PROJECT_ID="${WEBAUTO_PROJECT_ID:-prd_jt}"       # envで上書き可
+STORE_ROOT="${STORE_ROOT:-/opt/autoware/model-store}"
+LINK_ROOT="${LINK_ROOT:-/opt/autoware/mlmodels}"
+TARGET_DEFAULT="${TARGET_DEFAULT:-default}"       # 例: x2 等を都度指定可能
+LOG_DIR="/var/lib/autoware-mlswitch"
+mkdir -p "$LOG_DIR"
+
+# jqで拾うキー（webautoのJSONに合わせて必要なら微調整）
+JQ_PKG_LIST='.packages // .data // .results // .items // . | map({id: (.id // .package_id // .uuid), name: (.name // .package_name)})'
+JQ_REL_LIST='.releases // .data // .results // .items // . | map({id: (.id // .release_id // .uuid), version: (.version // .tag // .name // .id)})'
+
+#=== 共通ユーティリティ =====================================================
+die(){ echo "Error: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null || die "command not found: $1"; }
+need webauto; need jq
+
+ensure_dirs(){ sudo mkdir -p "$STORE_ROOT" "$LINK_ROOT"; }
+
+atomically_point_link(){ # $1: link, $2: target
+  local link="$1" target="$2" tmp="${1}.tmp.$$"
+  [ -e "$target" ] || die "target not found: $target"
+  sudo ln -s "$target" "$tmp"
+  sudo mv -Tf "$tmp" "$link"     # renameで原子的に置換
+}
+
+current_target(){ # $1: link
+  readlink -f "$1" 2>/dev/null || true
+}
+
+log_switch(){ # $1: model, $2: before, $3: after
+  echo "{\"ts\":$(date +%s),\"before\":\"$2\",\"after\":\"$3\"}" | sudo tee -a "$LOG_DIR/$1.jsonl" >/dev/null
+}
+
+#=== RELEASE選択の共通部品 ===============================================
+fetch_releases_json(){
+  local model="$1"
+  webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" --output json \
+    | jq -c '(.releases // .data // .results // .items // .) as $x | if ($x|type)=="array" then $x else [$x] end'
+}
+
+select_release(){ # in: model + (release_id | release_name | version[,target] | latest)
+  local model="$1" release_id="$2" release_name="$3" version="$4" target="$5" latest="$6"
+  local releases chosen
+
+  releases="$(fetch_releases_json "$model")"
+
+  if [ -n "$release_id" ]; then
+    chosen="$(echo "$releases" | jq -c --arg rid "$release_id" 'map(select(.id==$rid)) | sort_by(.created_at) | last')"
+  elif [ -n "$release_name" ]; then
+    chosen="$(echo "$releases" | jq -c --arg n "$release_name" 'map(select(.name==$n)) | sort_by(.created_at) | last')"
+  elif [ -n "$version" ] && [ -n "$target" ]; then
+    chosen="$(echo "$releases" | jq -c --arg v "$version" --arg t "$target" 'map(select(.name==($t+"/"+$v))) | sort_by(.created_at) | last')"
+  elif [ -n "$version" ]; then
+    # 末尾が /<version> のもの or name==version（スラッシュ無し系）を許容
+    chosen="$(echo "$releases" | jq -c --arg v "$version" 'map(select((.name|type=="string") and ((.name|endswith("/"+$v)) or (.name==$v)))) | sort_by(.created_at) | last')"
+  elif [ "$latest" = "1" ]; then
+    chosen="$(echo "$releases" | jq -c 'sort_by(.created_at) | last')"
+  else
+    echo "Error: release selector is required (use --latest | --version [--target] | --release-name | --release-id)" >&2
+    return 1
+  fi
+
+  [ -n "$chosen" ] && [ "$chosen" != "null" ] || { echo "Error: release not found (model=$model selector)" >&2; return 1; }
+
+  # export-like: stdoutに TSV (release_id,package_id,name) を返す
+  echo "$chosen" | jq -r '[.id, .package_id, .name] | @tsv'
+}
+
+parse_name_to_target_version(){ # in: name ; out: echo "<target>\t<version>"
+  local n="$1"
+  if [[ "$n" == */* ]]; then
+    echo -e "${n%%/*}\t${n##*/}"
+  else
+    echo -e "default\t${n}"
+  fi
+}
+
+#=== payload ルート検出（フラット展開用） ===============================
+detect_payload_root(){ # $1: tmpdir, $2: model
+  local base="$1" model="$2" d="$1"
+  # 1) 余計な1段ディレクトリ連結を最大3回まで剥がす（ディレクトリ1個のみ & ファイル0 のとき）
+  for _ in 1 2 3; do
+    local ndirs nfiles
+    ndirs="$(find "$d" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+    nfiles="$(find "$d" -mindepth 1 -maxdepth 1 -type f | wc -l)"
+    if [ "$nfiles" -eq 0 ] && [ "$ndirs" -eq 1 ]; then
+      d="$(find "$d" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    else
+      break
+    fi
+  done
+
+  # 2) d 直下に肝ファイル（*.onnx / *_ml_package.param.yaml / deploy_metadata.yaml）が無ければ、
+  #    よくある "<uuid>/<model>" パターンを試す
+  if ! find "$d" -maxdepth 1 -type f \( -name '*.onnx' -o -name '*_ml_package.param.yaml' -o -name 'deploy_metadata.yaml' \) | grep -q .; then
+    if [ -d "$d/$model" ]; then
+      d="$d/$model"
+    fi
+  fi
+
+  # 3) それでも見つからない場合は、肝ファイルを含む「最も浅い」ディレクトリを探索
+  if ! find "$d" -type f \( -name '*.onnx' -o -name '*_ml_package.param.yaml' -o -name 'deploy_metadata.yaml' \) | grep -q .; then
+    local cand
+    cand="$(find "$base" -type f \( -name '*.onnx' -o -name '*_ml_package.param.yaml' -o -name 'deploy_metadata.yaml' \) -printf '%h\n' \
+            | awk -F/ '{print NF, $0}' | sort -n | head -1 | cut -d' ' -f2-)"
+    if [ -n "$cand" ]; then d="$cand"; fi
+  fi
+
+  echo "$d"
+}
+
+
+#=== 1) モデル一覧 ==========================================================
+cmd_list_models(){
+  webauto ml package list --project-id "$PROJECT_ID" --output json \
+    | jq -r "$JQ_PKG_LIST | .[] | \"\(.id)\t\(.name)\"" \
+    || die "failed to list packages"
+}
+
+#=== 2) リリース一覧（モデル名指定） ========================================
+cmd_list_releases(){
+  local model="${1:-}"; [ -n "$model" ] || die "usage: mlpoc releases <model-name>"
+  webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" --output json \
+    | jq -r "$JQ_REL_LIST | .[] | \"\(.id)\t\(.version)\"" \
+    || die "failed to list releases"
+}
+
+#=== 3) 取得＆配置＆リンク切替 ==============================================
+#=== 3a) pull（切替なし） =================================================
+cmd_pull(){
+  local model="" release_id="" release_name="" version_override="" target="" latest="0" output_json="0"
+  local payload_subdir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model="$2"; shift 2;;
+      --release-id) release_id="$2"; shift 2;;
+      --release-name) release_name="$2"; shift 2;;
+      --version) version_override="$2"; shift 2;;
+      --target) target="$2"; shift 2;;
+      --latest) latest="1"; shift;;
+      --project-id) PROJECT_ID="$2"; shift 2;;
+      --json) output_json="1"; shift;;
+      --payload-subdir) payload_subdir="$2"; shift 2;;   # ★手動でサブディレクトリを指定したい場合
+      *) die "unknown arg: $1";;
+    esac
+  done
+  [ -n "$model" ] || die "usage: mlpoc pull --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json] [--payload-subdir <relpath>]"
+
+  ensure_dirs
+
+  # release解決（package_idも同時に取得）
+  local rid pid rname; IFS=$'\t' read -r rid pid rname < <(select_release "$model" "$release_id" "$release_name" "$version_override" "$target" "$latest")
+
+  # name から target/version を抽出（スラッシュ無ければ target=default, version=name）
+  local parsed_target parsed_version; IFS=$'\t' read -r parsed_target parsed_version < <(parse_name_to_target_version "$rname")
+
+  # pull
+  local tmpdir; tmpdir="$(mktemp -d)"
+  webauto ml package-release pull \
+    --project-id "$PROJECT_ID" \
+    --package-id "$pid" \
+    --package-release-id "$rid" \
+    --target-dir "$tmpdir" \
+    --output json --quiet >/dev/null
+
+  # バージョン名の最終決定（--version で上書き可）
+  local version="${version_override:-$parsed_version}"
+  local target_final="${target:-$parsed_target}"
+
+  # 原子的配置のため staging を用意
+  local dest="$STORE_ROOT/$model/$target_final/$version"
+  local staging; staging="$(mktemp -d --tmpdir "$model.$target_final.$version.staging.XXXX")"
+  sudo mkdir -p "$(dirname "$dest")"
+  [ -z "$(ls -A "$tmpdir")" ] && die "pulled dir is empty: $tmpdir"
+
+  # ★フラット展開：payload ルートを決定
+  local payload_root
+  if [ -n "$payload_subdir" ]; then
+    # 手動指定（tmpdir からの相対）
+    [ -d "$tmpdir/$payload_subdir" ] || die "--payload-subdir が不正: $payload_subdir"
+    payload_root="$tmpdir/$payload_subdir"
+  else
+    payload_root="$(detect_payload_root "$tmpdir" "$model")"
+  fi
+
+  # 中身だけを staging へコピー（payload_root/. → staging/.）
+  sudo cp -a "$payload_root"/. "$staging"/
+  rm -rf "$tmpdir"
+
+  # 最低限検証
+  if ! sudo find "$staging" -type f -name '*.onnx' | grep -q .; then
+    sudo rm -rf "$staging"; die "no .onnx found in staging"
+  fi
+
+  # 既存と入替
+  sudo rm -rf "$dest"
+  sudo mv -T "$staging" "$dest"
+
+  # 出力は既存どおり
+  if [ "$output_json" = "1" ]; then
+    printf '{"model":"%s","target":"%s","version":"%s","path":"%s","release_id":"%s","package_id":"%s","name":"%s"}\n' \
+      "$model" "$target_final" "$version" "$dest" "$rid" "$pid" "$rname"
+  else
+    echo "installed to: $dest  (release: $rname)"
+  fi
+}
+
+#=== 3b) pull + switch =====================================================
+cmd_pull_switch(){
+  # 引数仕様は cmd_pull と同じ + --no-switch（既存互換）
+  local no_switch="0"
+  # いったん pull を呼び、最後にスイッチまでやる
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-switch) no_switch="1"; shift;;
+      *) args+=("$1"); shift;;
+    esac
+  done
+
+  # pullを実行して結果JSONを受け取る
+  local result; result="$(cmd_pull "${args[@]}" --json)"
+  local model path; model="$(echo "$result" | jq -r .model)"; path="$(echo "$result" | jq -r .path)"
+
+  if [ "$no_switch" = "1" ]; then
+    echo "$result"
+    echo "(--no-switch のため参照は変更していません)"
+    return 0
+  fi
+
+  # switch
+  ensure_dirs
+  local link="$LINK_ROOT/$model"
+  local before; before="$(current_target "$link")"
+  atomically_point_link "$link" "$path"
+  log_switch "$model" "${before:-}" "$path"
+  echo "switched: $link -> $path"
+}
+
+#=== 4) 現在の参照確認・手動切替 ============================================
+cmd_current(){ local model="$1"; [ -n "$model" ] || die "usage: mlpoc current <model>"; current_target "$LINK_ROOT/$model"; }
+cmd_switch(){
+  # 互換: 第二引数が絶対パスなら従来どおりパス指定モード
+  if [[ "${2:-}" == /* ]]; then
+    local model="$1" target_path="$2"
+    [ -n "$model" ] && [ -n "$target_path" ] || die "usage: mlpoc switch <model> <abs-target-path>"
+    ensure_dirs
+    local link="$LINK_ROOT/$model"
+    local before; before="$(current_target "$link")"
+    [ -d "$target_path" ] || die "not a dir: $target_path"
+    if ! find "$target_path" -type f -name '*.onnx' | grep -q .; then die "no .onnx under $target_path"; fi
+    atomically_point_link "$link" "$target_path"
+    log_switch "$model" "${before:-}" "$target_path"
+    echo "switched: $link -> $target_path"
+    return
+  fi
+
+  # 新: model + (--target/--version | --latest --target | --pick)
+  local model="" target="" version="" latest=0 pick=0
+  model="$1"; shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target)  target="$2"; shift 2;;
+      --version) version="$2"; shift 2;;
+      --latest)  latest=1;   shift;;
+      --pick)    pick=1;     shift;;
+      *) die "usage: mlpoc switch <model> (--target <tgt> --version <ver> | --latest --target <tgt> | --pick [--target <tgt>])";;
+    esac
+  done
+  [ -n "$model" ] || die "usage: mlpoc switch <model> ..."
+
+  local target_path=""
+  if [ "$pick" = "1" ]; then
+    # 一覧生成
+    mapfile -t rows < <(list_local_tsv "$model")
+    [ ${#rows[@]} -gt 0 ] || die "no installed entries for model=$model"
+
+    # target 指定があれば絞り込み
+    if [ -n "$target" ]; then
+      rows=( $(printf "%s\n" "${rows[@]}" | awk -F'\t' -v t="$target" '$1==t {print}') )
+      [ ${#rows[@]} -gt 0 ] || die "no entries for model=$model target=$target"
+    fi
+
+    # fzf があれば使う、無ければ番号選択
+    local choice
+    if command -v fzf >/dev/null; then
+      choice="$(printf "%s\n" "${rows[@]}" \
+        | sort -t$'\t' -k1,1 -k2,2V \
+        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}' \
+        | fzf --prompt="select target/version > " | cut -f2)"
+    else
+      echo "Select entry:"
+      nl -w2 -s'. ' <(printf "%s\n" "${rows[@]}" \
+        | sort -t$'\t' -k1,1 -k2,2V \
+        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}')
+      read -r -p "number: " n
+      choice="$(printf "%s\n" "${rows[@]}" \
+        | sort -t$'\t' -k1,1 -k2,2V \
+        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}' | sed -n "${n}p" | cut -f2)"
+    fi
+    [ -n "$choice" ] || die "no selection"
+    target_path="$choice"
+  else
+    [ -n "$target" ] || die "--target is required (or use --pick)"
+    if [ -z "$version" ]; then
+      if [ "$latest" = "1" ]; then
+        version="$(find "$STORE_ROOT/$model/$target" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort -V | tail -1)"
+        [ -n "$version" ] || die "no versions under $STORE_ROOT/$model/$target"
+      else
+        die "--version is required unless --latest or --pick"
+      fi
+    fi
+    target_path="$STORE_ROOT/$model/$target/$version"
+  fi
+
+  ensure_dirs
+  local link="$LINK_ROOT/$model"
+  local before; before="$(current_target "$link")"
+  [ -d "$target_path" ] || die "not a dir: $target_path"
+  if ! find "$target_path" -type f -name '*.onnx' | grep -q .; then die "no .onnx under $target_path"; fi
+  atomically_point_link "$link" "$target_path"
+  log_switch "$model" "${before:-}" "$target_path"
+  echo "switched: $link -> $target_path"
+}
+
+#=== ローカルのインストール済み候補を TSV/JSON で取得 ====================
+list_local_tsv(){ # $1: model -> outputs: "<target>\t<version>\t<path>"
+  local model="$1" base="$STORE_ROOT/$model"
+  [ -d "$base" ] || return 0
+  for t in "$base"/*; do
+    [ -d "$t" ] || continue
+    local tgt="${t##*/}"
+    for v in "$t"/*; do
+      [ -d "$v" ] || continue
+      local ver="${v##*/}"
+      echo -e "$tgt\t$ver\t$v"
+    done
+  done
+}
+
+cmd_list_local(){
+  local model="" json=0
+  if [[ $# -ge 1 && "$1" != "--json" ]]; then model="$1"; shift; fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=1; shift;;
+      *) break;;
+    esac
+  done
+
+  if [ -z "$model" ]; then
+    # モデル名の一覧（/opt/autoware/model-store 直下）
+    [ -d "$STORE_ROOT" ] || exit 0
+    find "$STORE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort
+  else
+    if [ "$json" = "1" ]; then
+      list_local_tsv "$model" | awk -F'\t' 'NF==3' \
+        | jq -R -s -c 'split("\n") | map(select(length>0) | split("\t") | {target:.[0],version:.[1],path:.[2]})'
+    else
+      echo "model: $model"
+      printf "target\tversion\tpath\n"
+      list_local_tsv "$model" | sort -t$'\t' -k1,1 -k2,2V
+    fi
+  fi
+}
+
+#=== エントリポイント ========================================================
+case "${1:-}" in
+  models)      shift; cmd_list_models "$@";;
+  releases)    shift; cmd_list_releases "$@";;
+  pull)        shift; cmd_pull "$@";;
+  pull-switch) shift; cmd_pull_switch "$@";;
+  list)        shift; cmd_list_local "$@";;     # ★追加（ローカル一覧）
+  current)     shift; cmd_current "$@";;
+  switch)      shift; cmd_switch "$@";;
+  *)
+    cat <<'EOF'
+Usage:
+  # リモート一覧（webauto）
+  mlpoc models
+  mlpoc releases <model-name>
+
+  # ローカルにインストール済みの候補を表示
+  mlpoc list                      # モデル名のみ一覧
+  mlpoc list <model>              # <target>/<version>/path の一覧
+  mlpoc list <model> --json       # JSON で出力
+
+  # 取得のみ（配置するが参照は切り替えない）
+  sudo mlpoc pull --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--json]
+
+  # 取得して参照も切替
+  sudo mlpoc pull-switch --model <name> [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] [--project-id <pid>] [--no-switch]
+
+  # 現在の参照確認 / 既存実体へ手動切替
+  mlpoc current <model>
+
+  # 参照切替（パス不要、target/version 指定 or 対話選択）
+  sudo mlpoc switch <model> --target <tgt> --version <ver>
+  sudo mlpoc switch <model> --latest --target <tgt>
+  sudo mlpoc switch <model> --pick            # fzf があれば fzf、無ければ番号選択
+  # 互換: パス直接指定も可
+  sudo mlpoc switch <model> /opt/autoware/model-store/<model>/<target>/<version>
+
+Options:
+  --latest                   （switch/pull）候補のうち最新を選択（version は sort -V）
+  --pick                     （switch）対話選択モード。--target で候補を絞り込み可
+  --target <tgt>             例: xx1, x2
+  --version <ver>            例: 2.3.1
+  --release-name <name>      例: "xx1/2.3.0"
+  --release-id <rid>         直接ID
+  --project-id <pid>         既定=WEBAUTO_PROJECT_ID または prd_jt
+  --json                     JSON出力（pull/list）
+
+Env:
+  WEBAUTO_PROJECT_ID   (default: prd_jt)
+  STORE_ROOT           (default: /opt/autoware/model-store)
+  LINK_ROOT            (default: /opt/autoware/mlmodels)
+  TARGET_DEFAULT       (default: default)
+
+Notes:
+  * /opt/autoware 配下の書換や参照切替には sudo が必要です。
+  * list はローカルの実体を走査、switch は --target/--version からパスを自動解決します。
+EOF
+    ;;
+esac
