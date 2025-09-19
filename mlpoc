@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PAGE_TOKEN_FLAG="${PAGE_TOKEN_FLAG:---page-token}"
+DEFAULT_PAGE_LIMIT="${DEFAULT_PAGE_LIMIT:-30}"   # 0=無制限（全ページ）
+DEFAULT_MAX_PAGES="${DEFAULT_MAX_PAGES:-0}"     # 0=無制限
+
 #=== 設定（必要に応じて変更可） ============================================
 PROJECT_ID="${WEBAUTO_PROJECT_ID:-prd_jt}"       # envで上書き可
 STORE_ROOT="${STORE_ROOT:-/opt/autoware/model-store}"
@@ -36,17 +40,18 @@ log_switch(){ # $1: model, $2: before, $3: after
 }
 
 #=== RELEASE選択の共通部品 ===============================================
+# 既存呼び出し互換：limit/max_pages はデフォルト値
 fetch_releases_json(){
   local model="$1"
-  webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" --output json \
-    | jq -c '(.releases // .data // .results // .items // .) as $x | if ($x|type)=="array" then $x else [$x] end'
+  fetch_releases_json_paged "$model" "$DEFAULT_PAGE_LIMIT" "$DEFAULT_MAX_PAGES"
 }
 
 select_release(){ # in: model + (release_id | release_name | version[,target] | latest)
   local model="$1" release_id="$2" release_name="$3" version="$4" target="$5" latest="$6"
   local releases chosen
 
-  releases="$(fetch_releases_json "$model")"
+  # target 指定がある場合、name の prefix で事前フィルタ
+  releases="$(fetch_releases_json_paged "$model" 0 0 "$target")"
 
   if [ -n "$release_id" ]; then
     chosen="$(echo "$releases" | jq -c --arg rid "$release_id" 'map(select(.id==$rid)) | sort_by(.created_at) | last')"
@@ -55,7 +60,6 @@ select_release(){ # in: model + (release_id | release_name | version[,target] | 
   elif [ -n "$version" ] && [ -n "$target" ]; then
     chosen="$(echo "$releases" | jq -c --arg v "$version" --arg t "$target" 'map(select(.name==($t+"/"+$v))) | sort_by(.created_at) | last')"
   elif [ -n "$version" ]; then
-    # 末尾が /<version> のもの or name==version（スラッシュ無し系）を許容
     chosen="$(echo "$releases" | jq -c --arg v "$version" 'map(select((.name|type=="string") and ((.name|endswith("/"+$v)) or (.name==$v)))) | sort_by(.created_at) | last')"
   elif [ "$latest" = "1" ]; then
     chosen="$(echo "$releases" | jq -c 'sort_by(.created_at) | last')"
@@ -65,8 +69,6 @@ select_release(){ # in: model + (release_id | release_name | version[,target] | 
   fi
 
   [ -n "$chosen" ] && [ "$chosen" != "null" ] || { echo "Error: release not found (model=$model selector)" >&2; return 1; }
-
-  # export-like: stdoutに TSV (release_id,package_id,name) を返す
   echo "$chosen" | jq -r '[.id, .package_id, .name] | @tsv'
 }
 
@@ -81,17 +83,10 @@ parse_name_to_target_version(){ # in: name ; out: echo "<target>\t<version>"
 
 #=== リモート release を対話選択 ==========================================
 pick_release_interactive(){ # out: TSV "<release_id>\t<package_id>\t<name>"
-  local model="$1" target_filter="${2:-}"
+  local model="$1" target_filter="${2:-}" limit="${3:-0}" max_pages="${4:-0}"
   local releases lines choice
 
-  releases="$(fetch_releases_json "$model")"
-  # target 指定があれば name の先頭 "target/" でフィルタ
-  if [ -n "$target_filter" ]; then
-    releases="$(echo "$releases" | jq --arg t "$target_filter" \
-    '[.[] | select((.name|type=="string") and (.name|startswith($t+"/")))]')"
-
-  fi
-
+  releases="$(fetch_releases_json_paged "$model" "$limit" "$max_pages" "$target_filter")"
   if [ "$(echo "$releases" | jq 'length')" -eq 0 ]; then
     echo "no releases found for model=$model target=$target_filter" >&2
     return 1
@@ -101,7 +96,6 @@ pick_release_interactive(){ # out: TSV "<release_id>\t<package_id>\t<name>"
   lines="$(echo "$releases" | jq -r '
     sort_by(.created_at) | reverse
     | .[] | [.name, (.created_at // ""), .id, .package_id] | @tsv')"
-
 
   if command -v fzf >/dev/null; then
     choice="$(printf "%s\n" "$lines" \
@@ -114,7 +108,6 @@ pick_release_interactive(){ # out: TSV "<release_id>\t<package_id>\t<name>"
   fi
   [ -n "$choice" ] || return 1
 
-  # 返却: rid pid name
   local name created_at rid pid
   IFS=$'\t' read -r name created_at rid pid <<< "$choice"
   printf "%s\t%s\t%s\n" "$rid" "$pid" "$name"
@@ -154,6 +147,56 @@ detect_payload_root(){ # $1: tmpdir, $2: model
   echo "$d"
 }
 
+#=== releases をページングで全件（or制限付き）集約 ======================
+# 引数: $1=model, $2=limit(件数上限; 0=無制限), $3=max_pages(0=無制限), $4=optional target filter (name prefix)
+# 出力: 単一の JSON 配列（各要素が release オブジェクト）
+fetch_releases_json_paged(){
+  local model="$1" limit="${2:-$DEFAULT_PAGE_LIMIT}" max_pages="${3:-$DEFAULT_MAX_PAGES}" target_filter="${4:-}"
+  local token="" page=0
+  local agg tmp resp cur next
+  tmp="$(mktemp)"; echo "[]" > "$tmp"
+
+  while :; do
+    # 1) 呼び出し（トークン有無で切替）
+    if [ -n "$token" ]; then
+      resp="$(webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" "$PAGE_TOKEN_FLAG" "$token" --output json)"
+    else
+      resp="$(webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" --output json)"
+    fi
+
+    # 2) 今ページの releases 配列を抽出（フィールド名ゆらぎ吸収）
+    cur="$(echo "$resp" | jq -c '(.releases // .data // .results // .items // .) as $x | if ($x|type)=="array" then $x else [$x] end')"
+
+    # 3) target フィルタ（name の接頭辞が "<target>/"）
+    if [ -n "$target_filter" ]; then
+      cur="$(echo "$cur" | jq -c --arg t "$target_filter" '[ .[] | select((.name|type=="string") and (.name|startswith($t+"/"))) ]')"
+    fi
+
+    # 4) 集約に加える
+    jq -c --argjson add "$cur" '. + $add' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
+
+    # 5) 件数上限チェック
+    if [ "$limit" -gt 0 ]; then
+      local count
+      count="$(jq 'length' "$tmp")"
+      if [ "$count" -ge "$limit" ]; then
+        # 上限超過分を落とす
+        jq -c --argjson n "$limit" '.[0:$n]' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
+        break
+      fi
+    fi
+
+    # 6) 次ページ判定・回数上限
+    next="$(echo "$resp" | jq -r '.next_page_token // empty')"
+    page=$((page+1))
+    if [ -z "$next" ]; then break; fi
+    if [ "$max_pages" -gt 0 ] && [ "$page" -ge "$max_pages" ]; then break; fi
+    token="$next"
+  done
+
+  cat "$tmp"
+  rm -f "$tmp"
+}
 
 #=== 1) モデル一覧 ==========================================================
 cmd_list_models(){
@@ -163,6 +206,7 @@ cmd_list_models(){
 }
 
 #=== 2) リリース一覧（モデル名指定） ========================================
+
 cmd_list_releases(){
   local model="${1:-}"; [ -n "$model" ] || die "usage: mlpoc releases <model-name>"
   webauto ml package-release search --project-id "$PROJECT_ID" --package-name "$model" --output json \
