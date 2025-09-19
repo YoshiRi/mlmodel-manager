@@ -6,7 +6,7 @@ PROJECT_ID="${WEBAUTO_PROJECT_ID:-prd_jt}"       # envで上書き可
 STORE_ROOT="${STORE_ROOT:-/opt/autoware/model-store}"
 LINK_ROOT="${LINK_ROOT:-/opt/autoware/mlmodels}"
 TARGET_DEFAULT="${TARGET_DEFAULT:-default}"       # 例: x2 等を都度指定可能
-LOG_DIR="/var/lib/autoware-mlswitch"
+LOG_DIR="$HOME/.local/share/autoware-mlswitch"
 mkdir -p "$LOG_DIR"
 
 # jqで拾うキー（webautoのJSONに合わせて必要なら微調整）

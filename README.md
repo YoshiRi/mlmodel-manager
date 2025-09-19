@@ -10,6 +10,36 @@
 
 ---
 
+## Quick start
+
+もとの`/opt/autoware/mlmodels` に内容物がある場合必要に応じてバックアップしてください。
+
+```bash
+# perparation
+sudo chmod +x mlpoc
+sudo ln -sf "$(pwd)/mlpoc" /usr/local/bin/mlpoc
+# test 
+mlpoc --help
+```
+
+
+```bash
+mlpoc models
+mlpoc releases centerpoint
+mlpoc pull --model centerpoint --latest --target xx1 # or --pick
+mlpoc pull --model centerpoint --latest --target x2
+mlpoc switch centerpoint --latest --target xx1  # or --pick
+mlpoc current centerpoint
+```
+
+完了すれば下記のような表示になるはずです。
+```bash
+❯ mlpoc current centerpoint
+/opt/autoware/model-store/centerpoint/xx1/2.3.1
+```
+
+---
+
 ## 想定する動作フロー
 
 1. **リモートの候補を調査**：`mlpoc models` / `mlpoc releases <model>`（webauto 経由）
@@ -21,26 +51,6 @@
 
    * `/opt/autoware/mlmodels/<model>` → 対応する store パスへ **原子的にリンク置換**
    * 既存実体から **`--target/--version` 指定**または \*\*対話選択（`--pick`）\*\*で切替
-
-
-## Quick start
-
-もとの`/opt/autoware/mlmodels` に内容物がある場合消すがあります。必要に応じてバックアップしてください。
-
-```bash
-mlpoc models
-mlpoc releases centerpoint
-mlpoc pull --model centerpoint --latest --target xx1
-mlpoc pull --model centerpoint --latest --target x2
-mlpoc switch centerpoint --latest --target xx1  # or --pick
-mlpoc current centerpoint
-```
-
-完了すれば下記のような表示になるはずです。
-```bash
-❯ mlpoc current centerpoint
-/opt/autoware/model-store/centerpoint/xx1/2.3.1
-```
 
 ---
 
