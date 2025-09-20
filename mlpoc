@@ -36,7 +36,7 @@ log_switch(){ # $1: model, $2: before, $3: after
 }
 
 with_lock(){ # $1: model, $2...: command
-  local model="$1"; shift || die "with_lock requires command"
+  local model="$1"; shift || die "with_lock requires model and command arguments"
   local lock="/var/lock/mlpoc.${model}.lock"
   sudo mkdir -p /var/lock
   exec 9>"$lock"
