@@ -35,6 +35,37 @@ log_switch(){ # $1: model, $2: before, $3: after
   echo "{\"ts\":$(date +%s),\"before\":\"$2\",\"after\":\"$3\"}" | sudo tee -a "$LOG_DIR/$1.jsonl" >/dev/null
 }
 
+with_lock(){ # $1: model, $2...: command
+  local model="$1"; shift || die "with_lock requires command"
+  local lock="/var/lock/mlpoc.${model}.lock"
+  sudo mkdir -p /var/lock
+  exec 9>"$lock"
+  local status=0
+  if ! flock 9 "$@"; then
+    status=$?
+  fi
+  exec 9>&- || true
+  return $status
+}
+
+locked_switch_link(){ # $1: model, $2: link, $3: target_path
+  local model="$1" link="$2" target_path="$3"
+  ensure_dirs
+  [ -d "$target_path" ] || die "not a dir: $target_path"
+  if ! find "$target_path" -type f -name '*.onnx' | grep -q .; then die "no .onnx under $target_path"; fi
+  local before
+  before="$(current_target "$link")"
+  atomically_point_link "$link" "$target_path"
+  log_switch "$model" "${before:-}" "$target_path"
+  echo "switched: $link -> $target_path"
+}
+
+locked_install_model(){ # $1: dest, $2: staging
+  local dest="$1" staging="$2"
+  sudo rm -rf "$dest"
+  sudo mv -T "$staging" "$dest"
+}
+
 #=== RELEASE選択の共通部品 ===============================================
 fetch_releases_json(){
   local model="$1"
@@ -249,9 +280,8 @@ cmd_pull(){
     sudo rm -rf "$staging"; die "no .onnx found in staging"
   fi
 
-  # 既存と入替
-  sudo rm -rf "$dest"
-  sudo mv -T "$staging" "$dest"
+  # 既存と入替（同一modelで排他制御）
+  with_lock "$model" "$0" __locked-install "$dest" "$staging"
 
   # 出力は既存どおり
   if [ "$output_json" = "1" ]; then
@@ -285,13 +315,9 @@ cmd_pull_switch(){
     return 0
   fi
 
-  # switch
-  ensure_dirs
+  # switch（同一modelで排他制御）
   local link="$LINK_ROOT/$model"
-  local before; before="$(current_target "$link")"
-  atomically_point_link "$link" "$path"
-  log_switch "$model" "${before:-}" "$path"
-  echo "switched: $link -> $path"
+  with_lock "$model" "$0" __locked-switch "$model" "$link" "$path"
 }
 
 #=== 4) 現在の参照確認・手動切替 ============================================
@@ -301,14 +327,8 @@ cmd_switch(){
   if [[ "${2:-}" == /* ]]; then
     local model="$1" target_path="$2"
     [ -n "$model" ] && [ -n "$target_path" ] || die "usage: mlpoc switch <model> <abs-target-path>"
-    ensure_dirs
     local link="$LINK_ROOT/$model"
-    local before; before="$(current_target "$link")"
-    [ -d "$target_path" ] || die "not a dir: $target_path"
-    if ! find "$target_path" -type f -name '*.onnx' | grep -q .; then die "no .onnx under $target_path"; fi
-    atomically_point_link "$link" "$target_path"
-    log_switch "$model" "${before:-}" "$target_path"
-    echo "switched: $link -> $target_path"
+    with_lock "$model" "$0" __locked-switch "$model" "$link" "$target_path"
     return
   fi
 
@@ -370,14 +390,8 @@ cmd_switch(){
     target_path="$STORE_ROOT/$model/$target/$version"
   fi
 
-  ensure_dirs
   local link="$LINK_ROOT/$model"
-  local before; before="$(current_target "$link")"
-  [ -d "$target_path" ] || die "not a dir: $target_path"
-  if ! find "$target_path" -type f -name '*.onnx' | grep -q .; then die "no .onnx under $target_path"; fi
-  atomically_point_link "$link" "$target_path"
-  log_switch "$model" "${before:-}" "$target_path"
-  echo "switched: $link -> $target_path"
+  with_lock "$model" "$0" __locked-switch "$model" "$link" "$target_path"
 }
 
 #=== ローカルのインストール済み候補を TSV/JSON で取得 ====================
@@ -423,6 +437,8 @@ cmd_list_local(){
 
 #=== エントリポイント ========================================================
 case "${1:-}" in
+  __locked-switch) shift; locked_switch_link "$@";;
+  __locked-install) shift; locked_install_model "$@";;
   models)      shift; cmd_list_models "$@";;
   releases)    shift; cmd_list_releases "$@";;
   pull)        shift; cmd_pull "$@";;
