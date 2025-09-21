@@ -103,15 +103,26 @@ pick_release_interactive(){ # out: TSV "<release_id>\t<package_id>\t<name>"
 
 # name → <target>/<version> を抽出して「インストール済み」に ✔ を付ける
 lines="$(jq -r --argjson inst "$installed" '
-  def key_from_name:
-    try (capture("(?<t>[^/]+)/v?(?<v>[0-9]+(\\.[0-9]+){1,2})") | "\(.t)/\(.v)") catch null;
-  def is_installed($k): ($k!=null) and any($inst[]; . == $k);
+  # name: "x2/2.0.0" / "x2/v2.0.0" / "x2/2.0.0_hoge" 等を分解
+  #  versionは 1.2 / 1.2.3 / 1.2.3.4 など柔軟に
+  def parse_name:
+    try (
+      capture("^(?<t>[^/]+)/v?(?<v>[0-9]+(?:\\.[0-9]+)+)(?<suf>.*)?$")
+    ) catch null;
+
+  def normalized_key($obj):
+    if $obj == null then null else "\($obj.t)/\($obj.v)" end;
+
+  def is_installed_exact($obj):
+    # サフィックスが「空」のリリースだけを厳密一致の対象にする
+    ($obj != null) and (($obj.suf // "") == "") and
+    any($inst[]; . == normalized_key($obj));
 
   sort_by(.created_at) | reverse
   | .[] as $r
   | ($r.name // "") as $n
-  | ($n | key_from_name) as $k
-  | (if is_installed($k) then "✔" else "" end) as $mark    # ★ 空欄は空文字（スペースではない）
+  | ($n | parse_name) as $p
+  | (if is_installed_exact($p) then "✔" else "" end) as $mark
   | [$mark, $n, ($r.created_at // ""), $r.id, $r.package_id] | @tsv
 ' <<< "$releases")"
 
