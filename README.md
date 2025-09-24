@@ -14,18 +14,34 @@
 
 初回利用時は既存の `/opt/autoware/mlmodels` を必要に応じてバックアップしてください。
 
+Installation: 
+
 ```bash
+# clone 
+git clone https://github.com/YoshiRi/mlmodel-manager.git
 # setup
 sudo chmod +x mlpoc
 sudo ln -sf "$(pwd)/mlpoc" /usr/local/bin/mlpoc
 mlpoc --help
 ```
 
+model DL：
+```
+mlpoc pull centerpoint
+```
+
+参照切替：
+```
+mlpoc switch centerpoint
+```
+
+### other examples
+
 Switch まで一括で行う Demo：
 
 ```bash
-mlpoc models
-mlpoc releases centerpoint
+mlpoc models # リモート候補確認
+mlpoc releases centerpoint # リリース確認
 mlpoc pull-switch centerpoint # 対話選択後、自動で切替
 ll /opt/autoware/mlmodels/centerpoint
 ```
