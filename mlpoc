@@ -409,7 +409,7 @@ cmd_switch(){
     return
   fi
 
-  # 新: model + (--target/--version | --latest --target | --pick)
+  # 新: model + (--target/--version | --latest --target | 自動 --pick)
   local model="" target="" version="" latest=0 pick=0
   model="$1"; shift || true
   while [[ $# -gt 0 ]]; do
@@ -423,39 +423,52 @@ cmd_switch(){
   done
   [ -n "$model" ] || die "usage: mlpoc switch <model> ..."
 
+  # ★ 自動 pick 適用
+  #   - 何も指定が無ければ pick=1
+  #   - --target のみ指定（--version/--latest/--pick なし）でも pick=1
+  if [ "$pick" -eq 0 ]; then
+    if [ -z "$target$version" ] && [ "$latest" -eq 0 ]; then
+      pick=1
+    elif [ -n "$target" ] && [ -z "$version" ] && [ "$latest" -eq 0 ]; then
+      pick=1
+    fi
+  fi
+
   local target_path=""
   if [ "$pick" = "1" ]; then
-    # 一覧生成
+    # ローカル一覧（target\tversion\tpath）
     mapfile -t rows < <(list_local_tsv "$model")
     [ ${#rows[@]} -gt 0 ] || die "no installed entries for model=$model"
 
-    # target 指定があれば絞り込み
+    # target 絞り込み
     if [ -n "$target" ]; then
       rows=( $(printf "%s\n" "${rows[@]}" | awk -F'\t' -v t="$target" '$1==t {print}') )
       [ ${#rows[@]} -gt 0 ] || die "no entries for model=$model target=$target"
     fi
 
-    # fzf があれば使う、無ければ番号選択
+    # 現在参照を ✔ 表示
+    local cur="$(readlink -f "$LINK_ROOT/$model" 2>/dev/null || true)"
+    local view; view="$(printf "%s\n" "${rows[@]}" \
+      | sort -t$'\t' -k1,1 -k2,2V \
+      | awk -F'\t' -v c="$cur" '{mark = (c==$3 ? "✔" : ""); printf "%s\t%s\t%s\t%s\n", mark, $1, $2, $3}')"
+
+    # 選択（fzf/番号）
     local choice
     if command -v fzf >/dev/null; then
-      choice="$(printf "%s\n" "${rows[@]}" \
-        | sort -t$'\t' -k1,1 -k2,2V \
-        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}' \
-        | fzf --prompt="select target/version > " | cut -f2)"
+      choice="$(printf "%s\n" "$view" \
+        | fzf --delimiter=$'\t' --with-nth=1,2,3 --prompt="select target/version > " \
+        | cut -f4)"
     else
-      echo "Select entry:"
-      nl -w2 -s'. ' <(printf "%s\n" "${rows[@]}" \
-        | sort -t$'\t' -k1,1 -k2,2V \
-        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}')
+      echo "Select entry (✔ = current):"
+      nl -w2 -s'. ' <(printf "%s\n" "$view" | cut -f1-3)
       read -r -p "number: " n
-      choice="$(printf "%s\n" "${rows[@]}" \
-        | sort -t$'\t' -k1,1 -k2,2V \
-        | awk -F'\t' '{printf "%s/%s\t%s\n",$1,$2,$3}' | sed -n "${n}p" | cut -f2)"
+      choice="$(printf "%s\n" "$view" | sed -n "${n}p" | cut -f4)"
     fi
     [ -n "$choice" ] || die "no selection"
     target_path="$choice"
   else
-    [ -n "$target" ] || die "--target is required (or use --pick)"
+    # 非 pick: 明示指定を解決
+    [ -n "$target" ] || die "--target is required (or run without options to pick interactively)"
     if [ -z "$version" ]; then
       if [ "$latest" = "1" ]; then
         version="$(find "$STORE_ROOT/$model/$target" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort -V | tail -1)"
