@@ -137,11 +137,19 @@ else
   read -r -p "number: " n
   choice="$(printf "%s\n" "$lines" | sed -n "${n}p")"
 fi
-[ -n "$choice" ] || return 1
+[ -n "$choice" ] || { echo "selection canceled" >&2; return 1; }
 
-# 返却: rid pid name（列ズレしない前提で fzf/番号選択とも同じTSV扱い）
-local mark name created_at rid pid
-IFS=$'\t' read -r mark name created_at rid pid <<< "$choice"
+# 列は必ず: 1=mark 2=name 3=created_at 4=release_id 5=package_id
+# read ではなく cut -f で厳密に取り出す（IFSや余計な空白の影響を排除）
+local rid pid name
+rid="$(printf "%s\n" "$choice" | cut -f4)"
+pid="$(printf "%s\n" "$choice" | cut -f5)"
+name="$(printf "%s\n" "$choice" | cut -f2)"
+
+[ -n "$rid" ] || { echo "parse error: empty release_id in selection" >&2; return 1; }
+[ -n "$pid" ] || { echo "parse error: empty package_id in selection" >&2; return 1; }
+[ -n "$name" ] || { echo "parse error: empty name in selection" >&2; return 1; }
+
 printf "%s\t%s\t%s\n" "$rid" "$pid" "$name"
 }
 
