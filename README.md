@@ -15,10 +15,10 @@
 もとの`/opt/autoware/mlmodels` に内容物がある場合必要に応じてバックアップしてください。
 
 ```bash
-# perparation
+# preparation
 sudo chmod +x mlpoc
 sudo ln -sf "$(pwd)/mlpoc" /usr/local/bin/mlpoc
-# test 
+# test
 mlpoc --help
 ```
 
@@ -26,9 +26,10 @@ mlpoc --help
 ```bash
 mlpoc models
 mlpoc releases centerpoint
-mlpoc pull --model centerpoint --latest --target xx1 # or --pick
-mlpoc pull --model centerpoint --latest --target x2
-mlpoc switch centerpoint --latest --target xx1  # or --pick
+sudo mlpoc pull --model centerpoint --latest --target xx1 # or --pick
+sudo mlpoc pull --model centerpoint --latest --target x2
+mlpoc list centerpoint
+sudo mlpoc switch centerpoint --latest --target xx1  # or --pick
 mlpoc current centerpoint
 ```
 
@@ -46,6 +47,7 @@ mlpoc current centerpoint
 2. **必要なリリースを取得（pull）**：
 
    * `mlpoc pull` で model/target/version に従い **原子的に配置**
+   * `--pick` で webauto 上のリリース候補を対話選択（`--target` でフィルタ可能）
    * 配布物に余計なネスト（`<uuid>/centerpoint` など）があっても **payload ルート検出**で直下にフラット展開
 3. **運用参照の切替（switch）**：
 
@@ -90,7 +92,7 @@ mlpoc current centerpoint
 
     * `package_id` → package id
     * `id` → release id
-    * `name` → リリース名（例: `xx1/2.3.0`）。`target/version` の推定に使用
+    * `name`（または `version`/`tag`）→ リリース名（例: `xx1/2.3.0`）。`target/version` の推定に使用
     * `created_at` → 最新判定（`--latest`）に利用
 
 * **リリース取得（pull）**：
@@ -127,7 +129,8 @@ mlpoc current centerpoint
 * `WEBAUTO_PROJECT_ID`：既定のプロジェクト ID（デフォルト: `prd_jt`）
 * `STORE_ROOT`：モデル実体のルート（デフォルト: `/opt/autoware/model-store`）
 * `LINK_ROOT`：運用リンクのルート（デフォルト: `/opt/autoware/mlmodels`）
-* `TARGET_DEFAULT`：target 未指定時の仮の既定（デフォルト: `default`）
+
+> `TARGET_DEFAULT` はスクリプト内で定義されていますが、現行実装ではリリース名から target/version を推測するため利用されません。
 
 > いずれもサブコマンドの引数で都度上書き可能です。
 
@@ -154,20 +157,27 @@ mlpoc list <model> --json  # JSON で出力
 
 ```bash
 sudo mlpoc pull --model <name> \
-  [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid>] \
+  [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid> | --pick] \
   [--project-id <pid>] [--json] [--payload-subdir <relpath>]
 ```
 
 * `--latest`：`created_at` が最新のリリースを選択
 * `--version` + `--target`：`name = target/version` を解決
 * `--release-name`：`"xx1/2.3.1"` のように name を直接指定
+* `--release-id`：release id を直接指定
+* `--pick`：リモートのリリース候補を対話選択（`--target` で絞り込み、`fzf` があればファジー検索）
 * `--payload-subdir`：自動検出が合わない特殊ケース向け
+* `--json`：選択結果を JSON（model/target/version/path など）で出力
 
 ### 取得して参照も切替（原子的 symlink 切替）
 
 ```bash
-sudo mlpoc pull-switch --model <name> [同上の指定] [--no-switch]
+sudo mlpoc pull-switch --model <name> \
+  [--latest | --version <ver> [--target <tgt>] | --release-name <name> | --release-id <rid> | --pick] \
+  [--project-id <pid>] [--json] [--payload-subdir <relpath>] [--no-switch]
 ```
+
+* `--no-switch`：実体だけ pull し、参照は切替えず JSON をそのまま出力
 
 ### 参照の切替（ローカル既存から）
 
@@ -198,7 +208,7 @@ mlpoc current <model>
 * **原子的な切替**：一時リンク作成 → `rename` による置換で中断時も壊れリンクを見せない
 * **フラット展開**：payload ルート自動検出（最大数階層の空ディレクトリ剥離 → `<uuid>/<model>` 推測 → 重要ファイルを含む最浅ディレクトリ探索）
 * **権限最小化**：検証は非特権でも可能／実ファイル配置とリンク置換は `sudo` 実行
-* **ロギング**：`/var/lib/autoware-mlswitch/<model>.jsonl` に切替履歴を追記（ts/before/after）
+* **ロギング**：`$HOME/.local/share/autoware-mlswitch/<model>.jsonl` に切替履歴を追記（ts/before/after）
 * **寛容な JSON パース**：`webauto` の返却差異に備え、複数のキー候補を許容する `jq` 式
 
 ---
